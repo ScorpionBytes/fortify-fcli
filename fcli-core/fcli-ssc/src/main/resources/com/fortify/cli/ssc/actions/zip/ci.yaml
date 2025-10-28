@@ -25,6 +25,10 @@ config:
   run.fcli.status.check.default: false # By default, we want to continue on fcli failures
   run.fcli.group.default: ciGroup
   mcp: exclude
+  mask.env-vars:
+    DEBRICKED_ACCESS_TOKEN:
+      sensitivity: high
+
   
 steps:
   # Configure module; allows for copying/re-using similar #actionCmd invocations in FoD ci action
@@ -47,16 +51,18 @@ steps:
       # Configure session name
       sessionName: ci-${#action.runID()}
       # Configure scan types to run
-      sca.skipReason:   # TODO
-      sca.skip: true
       dast.skipReason:  # TODO
       dast.skip: true
-      sast.skipReason: > # Enabled by default, unless explicitly disabled or other scan type requested
+      sast.skipReason: > # Enabled by default, unless explicitly disabled
         ${
-            #skipReasonIf(#env('DO_SAST_SCAN')=='false', 'SAST scan disabled as DO_SAST_SCAN==false')
-            ?:#skipReasonIf(#env('DO_SAST_SCAN')!='true' && (!sca.skip || !dast.skip), 'SAST scan disabled as DO_SAST_SCAN!=true and other scan type requested')
+            #fcliCmdSkipFromEnvReason('SAST_SCAN', false)
         }
-      aviator.skipReason: >
+      debricked.skipReason: > # Enabled if DEBRICKED_ACCESS_TOKEN specified, unless explicitly disabled
+        ${
+            #fcliCmdSkipFromEnvReason('DEBRICKED_SCAN', false)
+            ?:#skipBlankEnvReason('DEBRICKED_ACCESS_TOKEN')
+        }
+      aviator.skipReason: > # Enabled if AVIATOR_TOKEN & AVIATOR_URL specified, unless explicitly disabled
         ${
             #fcliCmdSkipFromEnvReason('AVIATOR_AUDIT', false)
             ?:#skipBlankEnvReason('AVIATOR_TOKEN')
@@ -64,9 +70,18 @@ steps:
         }
       aviator.loginOpts: --url=AVIATOR_URL
       aviator.app: ${#env('AVIATOR_APP')?:'::av::application.name'}
-      # Post-scan tasks will be skipped with the following reason, unless this variable is
-      # reset to null by one of the SAST/DAST/SCA/ scan/wait tasks in their on.success blocks
-      postScan.skipReason: No scans have been run because they failed or were skipped
+      wait.skipReason: > # Enabled by default, unless explicitly disabled through DO_WAIT or DO_SAST_WAIT (deprecated)
+        ${
+            #fcliCmdSkipFromEnvReason('WAIT', false)
+            ?:#fcliCmdSkipFromEnvReason('SAST_WAIT', false) 
+        }
+      # Post-scan tasks will be skipped if wait is skipped or if no scans were completed
+      # successfully. Post-scan skip reason will be reset to null once the wait task for
+      # any scan completed successfully. 
+      postScan.skipReason: >
+        ${
+            wait.skipReason?:'No scans have been run because they failed or were skipped'
+        }
 
   # Set up Aviator session if necessary
   - with:
@@ -109,7 +124,25 @@ steps:
               skip.if-reason:
                 - ${sast.skipReason}                     # Skip if SAST scan is skipped
                 - ${PACKAGE_ACTION.dependencySkipReason} # Skip if PACKAGE_ACTION was skipped or failed
-          
+            
+            DEBRICKED_SCAN_ACTION: 
+              cmd: ${#actionCmd('DEBRICKED_SCAN_ACTION', 'ssc', 'debricked-scan')} --source-dir "${global.ci.sourceDir}" --av "${global.ci.av}"
+              skip.if-reason:
+                - ${debricked.skipReason}                # Skip if Debricked scan is skipped
+              on.success:
+                - if: ${global.debrickedScan?.policyFailure==true} # TODO Test this
+                  var.set: 
+                    DEBRICKED_SCAN_ACTION.status: 'WARNING'
+                    DEBRICKED_SCAN_ACTION.statusReason: 'Debricked scan completed with policy violations'
+            
+            DEBRICKED_WAIT:
+              cmd: "${#fcliCmd('DEBRICKED_WAIT', global.debrickedPublish.waitForCmd)}"
+              skip.if-reason:
+                - ${wait.skipReason}                                 # Skip if wait.skipReason!=null
+                - ${DEBRICKED_SCAN_ACTION.dependencySkipReason}      # Skip if DEBRICKED_SCAN_ACTION was skipped or failed
+              on.success:
+                - var.set: { postScan.skipReason: } # Reset postScan.skipReason to allow post-scan tasks to run       
+            
             # TODO Improve this to:
             # - Wait for scan completion (but not publish completion)
             # - Download logs/fpr if debugging is enabled
@@ -117,8 +150,8 @@ steps:
             SAST_WAIT:
               cmd: "${#fcliCmd('SAST_WAIT', 'sc-sast scan wait-for')} ::sc_sast_scan::"
               skip.if-reason:
-                - ${#fcliCmdSkipFromEnvReason('SAST_WAIT', false)} # Skip if DO_SAST_WAIT==false
-                - ${SAST_SCAN.dependencySkipReason}                # Skip if SAST_SCAN was skipped or failed
+                - ${wait.skipReason}                                 # Skip if wait.skipReason!=null
+                - ${SAST_SCAN.dependencySkipReason}                  # Skip if SAST_SCAN was skipped or failed
               on.success:
                 - var.set: { postScan.skipReason: } # Reset postScan.skipReason to allow post-scan tasks to run
                 
@@ -180,6 +213,13 @@ steps:
                 - ${#actionCmdSkipFromEnvReason('SAST_EXPORT', false)} # Skip if DO_SAST_EXPORT==false
                 - ${#actionCmdSkipNoActionReason('SAST_EXPORT', 'ssc', global.ci.ssc_sastExportAction)}
                 - ${SAST_WAIT.dependencySkipReason}                    # Skip if SAST_WAIT was skipped or failed
+
+            DEBRICKED_EXPORT:
+              cmd: ${#actionCmd('DEBRICKED_EXPORT', 'ssc', global.ci.ssc_scaExportAction)} --av "${global.ci.av}"
+              skip.if-reason:
+                - ${#actionCmdSkipFromEnvReason('DEBRICKED_EXPORT', false)} # Skip if DO_DEBRICKED_EXPORT==false
+                - ${#actionCmdSkipNoActionReason('DEBRICKED_EXPORT', 'ssc', global.ci.ssc_scaExportAction)}
+                - ${DEBRICKED_WAIT.dependencySkipReason}                    # Skip if SAST_WAIT was skipped or failed
           
   - with:
       writers:
